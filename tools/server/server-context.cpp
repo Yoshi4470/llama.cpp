@@ -2976,12 +2976,6 @@ private:
                 {
                     const bool use_ckpt = slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                    // only save the sampler sampler state if we use checkpoints
-                    common_sampler_ptr smpl_save;
-                    if (use_ckpt) {
-                        smpl_save.reset(common_sampler_clone(slot.smpl.get()));
-                    }
-
                     GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                     auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx, slot.spec_i_batch, slot.spec_draft);
                     slot.spec_i_batch.clear();
@@ -2992,15 +2986,14 @@ private:
                     if (accepted.size() < slot.spec_draft.size() + 1) {
                         if (use_ckpt) {
                             if (trace > 0) {
-                                SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
+                                SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint and replay accepted tokens)\n", accepted.size() - 1, slot.spec_draft.size());
                             }
 
-                            // partial acceptance is not supported by the context -> truncate the draft and restore the state
-                            slot.spec_draft = std::move(accepted);
-
+                            // Partial removal is not supported by the context, so roll back to the checkpoint and
+                            // replay the already sampled accepted prefix without sampling it again.
                             const auto & ckpt = slot.spec_ckpt;
 
-                            SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n",
+                            SLT_DBG(slot, "restoring speculative checkpoint for partial accept replay (pos_min = %d, pos_max = %d, size = %zu)\n",
                                     ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
                             const size_t n = llama_state_seq_set_data_ext(slot.ctx, ckpt.data.data(), ckpt.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -3012,7 +3005,52 @@ private:
                             llama_memory_seq_rm(llama_get_memory(slot.ctx), slot.id, ckpt.pos_max + 1, -1);
 
                             slot.prompt.tokens.keep_first(ckpt.n_tokens);
-                            slot.smpl = std::move(smpl_save);
+
+                            llama_batch replay = llama_batch_init(accepted.size(), 0, 1);
+                            llama_pos pos = slot.prompt.tokens.pos_next();
+
+                            common_batch_add(replay, slot.sampled, pos++, { slot.id }, false);
+                            slot.prompt.tokens.push_back(slot.sampled);
+
+                            for (size_t j = 0; j + 1 < accepted.size(); ++j) {
+                                common_batch_add(replay, accepted[j], pos++, { slot.id }, false);
+                                slot.prompt.tokens.push_back(accepted[j]);
+                            }
+
+                            const int ret = llama_decode(slot.ctx, replay);
+                            llama_batch_free(replay);
+                            if (ret != 0) {
+                                send_error(slot, "failed to replay partially accepted speculative tokens");
+                                slot.release();
+                                continue;
+                            }
+
+                            common_speculative_accept(slot.spec.get(), accepted.size() - 1);
+
+                            const int64_t t_current = ggml_time_us();
+                            slot.n_decoded += accepted.size();
+                            slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
+                            slot.n_draft_accepted += accepted.size() - 1;
+
+                            slot.sampled = accepted.back();
+                            slot.spec_draft.clear();
+
+                            for (size_t j = 0; j < accepted.size(); ++j) {
+                                completion_token_output result;
+
+                                result.tok          = accepted[j];
+                                result.text_to_send = common_token_to_piece(slot.ctx, result.tok, accept_special_token(slot, result.tok));
+                                result.prob         = 1.0f; // set later
+
+                                if (!process_token(result, slot)) {
+                                    slot.print_timings();
+                                    send_final_response(slot);
+                                    metrics.on_prediction(slot);
+                                    slot.release();
+
+                                    break;
+                                }
+                            }
 
                             continue;
                         }
