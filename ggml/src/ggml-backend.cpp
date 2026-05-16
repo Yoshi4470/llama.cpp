@@ -345,7 +345,10 @@ void ggml_backend_tensor_get(const struct ggml_tensor * tensor, void * data, siz
         return;
     }
 
-    GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
+    {
+        const ggml_tensor * alloc = tensor->view_src ? tensor->view_src : tensor;
+        GGML_ASSERT(alloc->data != NULL && "tensor not allocated");
+    }
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor read out of bounds");
 
     buf->iface.get_tensor(buf, tensor, data, offset, size);
