@@ -108,3 +108,33 @@ To conserve context space, load these resources as needed:
 - [Jinja engine](common/jinja/README.md)
 - [How to add a new model](docs/development/HOWTO-add-model.md)
 - [PR template](.github/pull_request_template.md)
+
+## Cursor Cloud specific instructions
+
+### Environment overview
+
+llama.cpp is a C/C++ project built with CMake. Key services:
+
+- **C/C++ build** (`cmake -B build -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DLLAMA_CURL=ON -DLLAMA_BUILD_TESTS=ON && cmake --build build --config Release -j $(nproc)`) — produces `build/bin/llama-server`, `llama-cli`, `llama-completion`, test binaries, etc.
+- **llama-server** — OpenAI-compatible HTTP server. Run: `LD_LIBRARY_PATH=build/bin build/bin/llama-server -m <model.gguf> --host 0.0.0.0 --port 8080`
+- **Python venv** at `.venv/` with test & conversion deps.
+
+### Gotchas
+
+- The default `cc`/`c++` symlinks point to **clang 18** which cannot find `<array>` and other C++ standard library headers. Always pass `-DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++` to cmake, or the build will fail.
+- The `libstdc++.so` linker symlink may be missing from the standard library path. If the linker reports `cannot find -lstdc++`, create it: `sudo ln -sf /usr/lib/gcc/x86_64-linux-gnu/13/libstdc++.so /usr/lib/x86_64-linux-gnu/libstdc++.so`
+- Shared libraries are built into `build/bin/`. Set `LD_LIBRARY_PATH=build/bin` when running any built binary outside of ctest.
+- `python3.12-venv` package must be installed for `python3 -m venv` to work.
+
+### Testing
+
+- **C++ tests**: `cd build && ctest --test-dir . -L main --output-on-failure -j $(nproc)` (some tests like `test-tokenizers-ggml-vocabs` require model downloads and may fail without them).
+- **Server integration tests (pytest)**: See `tools/server/tests/README.md`. Quick run: `source .venv/bin/activate && cd tools/server/tests && LLAMA_SERVER_BIN_PATH=$(pwd)/../../../build/bin/llama-server LD_LIBRARY_PATH=$(pwd)/../../../build/bin pytest -v -x -m "not slow" unit/test_chat_completion.py`
+- **Lint (Python)**: `source .venv/bin/activate && flake8 convert_hf_to_gguf.py`
+
+### Small test model
+
+Download `tinyllamas/stories260K.gguf` for quick testing:
+```
+source .venv/bin/activate && python3 -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='ggml-org/models', filename='tinyllamas/stories260K.gguf', local_dir='models')"
+```
