@@ -22,6 +22,11 @@
 #include <algorithm>
 #include <vector>
 
+static ggml_backend_buffer_t ggml_backend_tensor_get_buffer(const struct ggml_tensor * tensor) {
+    GGML_ASSERT(tensor);
+    return tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+}
+
 #ifdef __APPLE__
 #include <sys/types.h>
 #include <sys/sysctl.h>
@@ -203,8 +208,8 @@ void ggml_backend_buffer_reset(ggml_backend_buffer_t buffer) {
 }
 
 bool ggml_backend_buffer_copy_tensor(const struct ggml_tensor * src, struct ggml_tensor * dst) {
-    ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
-    if (dst_buf->iface.cpy_tensor) {
+    ggml_backend_buffer_t dst_buf = ggml_backend_tensor_get_buffer(dst);
+    if (dst_buf && dst_buf->iface.cpy_tensor) {
         return dst_buf->iface.cpy_tensor(dst_buf, src, dst);
     }
     return false;
@@ -484,13 +489,16 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
         return;
     }
 
-    if (ggml_backend_buffer_is_host(src->buffer)) {
+    ggml_backend_buffer_t src_buf = ggml_backend_tensor_get_buffer(src);
+    ggml_backend_buffer_t dst_buf = ggml_backend_tensor_get_buffer(dst);
+
+    if (ggml_backend_buffer_is_host(src_buf)) {
         ggml_backend_tensor_set(dst, src->data, 0, ggml_nbytes(src));
-    } else if (ggml_backend_buffer_is_host(dst->buffer)) {
+    } else if (ggml_backend_buffer_is_host(dst_buf)) {
         ggml_backend_tensor_get(src, dst->data, 0, ggml_nbytes(src));
     } else if (!ggml_backend_buffer_copy_tensor(src, dst)) {
 #ifndef NDEBUG
-        GGML_LOG_DEBUG("%s: warning: slow copy from %s to %s\n", __func__, ggml_backend_buffer_name(src->buffer), ggml_backend_buffer_name(dst->buffer));
+        GGML_LOG_DEBUG("%s: warning: slow copy from %s to %s\n", __func__, ggml_backend_buffer_name(src_buf), ggml_backend_buffer_name(dst_buf));
 #endif // NDEBUG
         size_t nbytes = ggml_nbytes(src);
         void * data = malloc(nbytes);
@@ -2253,7 +2261,7 @@ static void ggml_backend_cpu_buffer_get_tensor(ggml_backend_buffer_t buffer, con
 
 static bool ggml_backend_cpu_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * src, struct ggml_tensor * dst) {
     GGML_ASSERT(src);
-    if (ggml_backend_buffer_is_host(src->buffer)) {
+    if (ggml_backend_buffer_is_host(ggml_backend_tensor_get_buffer(src))) {
         memcpy(dst->data, src->data, ggml_nbytes(src));
         return true;
     }
