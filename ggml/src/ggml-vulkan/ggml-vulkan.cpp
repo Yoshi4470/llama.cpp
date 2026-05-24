@@ -13867,8 +13867,13 @@ static void ggml_vk_get_device_description(int device, char * description, size_
 
 // device backend
 
+static ggml_backend_buffer_t ggml_vk_tensor_get_buffer(const ggml_tensor * tensor) {
+    GGML_ASSERT(tensor);
+    return tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+}
+
 static bool ggml_backend_buffer_is_vk(ggml_backend_buffer_t buffer) {
-    return buffer->buft->iface.get_name == ggml_backend_vk_buffer_type_name;
+    return buffer && buffer->buft->iface.get_name == ggml_backend_vk_buffer_type_name;
 }
 
 static void ggml_backend_vk_buffer_free_buffer(ggml_backend_buffer_t buffer) {
@@ -13964,14 +13969,17 @@ static bool ggml_backend_vk_buffer_cpy_tensor(ggml_backend_buffer_t buffer, cons
         return true;
     }
 
-    if (ggml_backend_buffer_is_vk(src->buffer)) {
-        ggml_backend_vk_buffer_context * src_buf_ctx = (ggml_backend_vk_buffer_context *)src->buffer->context;
-        ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
+    ggml_backend_buffer_t src_buf = ggml_vk_tensor_get_buffer(src);
+    ggml_backend_buffer_t dst_buf = ggml_vk_tensor_get_buffer(dst);
 
-        vk_buffer src_buf = src_buf_ctx->dev_buffer;
-        vk_buffer dst_buf = dst_buf_ctx->dev_buffer;
+    if (src_buf && dst_buf && ggml_backend_buffer_is_vk(src_buf)) {
+        ggml_backend_vk_buffer_context * src_buf_ctx = (ggml_backend_vk_buffer_context *)src_buf->context;
+        ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst_buf->context;
 
-        ggml_vk_buffer_copy(dst_buf, vk_tensor_offset(dst) + dst->view_offs, src_buf, vk_tensor_offset(src) + src->view_offs, ggml_nbytes(src));
+        vk_buffer src_dev = src_buf_ctx->dev_buffer;
+        vk_buffer dst_dev = dst_buf_ctx->dev_buffer;
+
+        ggml_vk_buffer_copy(dst_dev, vk_tensor_offset(dst) + dst->view_offs, src_dev, vk_tensor_offset(src) + src->view_offs, ggml_nbytes(src));
 
         return true;
     }
