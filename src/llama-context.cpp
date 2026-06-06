@@ -2561,7 +2561,10 @@ public:
         llama_memory_buffers mbufs_new;
 
         for (const auto & winfo : winfos) {
-            auto * buft = ggml_backend_buffer_get_type(winfo.tensor->buffer);
+            const ggml_tensor * t = winfo.tensor;
+            ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+            GGML_ASSERT(buf != nullptr && "tensor buffer not set");
+            auto * buft = ggml_backend_buffer_get_type(buf);
 
             mbufs_new[buft].n_tensors++;
             mbufs_new[buft].total_size += winfo.size;
@@ -2581,7 +2584,10 @@ public:
         }
 
         for (const auto & winfo : winfos) {
-            auto * buft = ggml_backend_buffer_get_type(winfo.tensor->buffer);
+            const ggml_tensor * t = winfo.tensor;
+            ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+            GGML_ASSERT(buf != nullptr && "tensor buffer not set");
+            auto * buft = ggml_backend_buffer_get_type(buf);
 
             const int64_t n = winfo.size/ggml_element_size(winfo.tensor);
 
@@ -2693,7 +2699,10 @@ public:
         llama_memory_buffers mbufs_new;
 
         for (const auto & rinfo : rinfos) {
-            auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
+            const ggml_tensor * t = rinfo.tensor;
+            ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+            GGML_ASSERT(buf != nullptr && "tensor buffer not set");
+            auto * buft = ggml_backend_buffer_get_type(buf);
 
             mbufs_new[buft].n_tensors++;
             mbufs_new[buft].total_size += rinfo.size;
@@ -2712,7 +2721,10 @@ public:
         }
 
         for (const auto & rinfo : rinfos) {
-            auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
+            const ggml_tensor * t = rinfo.tensor;
+            ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+            GGML_ASSERT(buf != nullptr && "tensor buffer not set");
+            auto * buft = ggml_backend_buffer_get_type(buf);
 
             const int64_t n = rinfo.size/ggml_element_size(rinfo.tensor);
 
