@@ -24,18 +24,23 @@
 #include <climits>
 #include <vector>
 
-// represents raw image data, layout is RGBRGBRGB...
-// length of data must be nx * ny * 3
+// for still image data, layout is RGBRGBRGB...
+// length of data must be nx * ny * 3 bytes
+//
 // for audio bitmap: nx = sample count, ny = 1, layout is F32 F32 F32 ...
-// length of data must be nx * sizeof(float)
+// length of data must be nx * sizeof(float) bytes
 struct mtmd_bitmap {
     uint32_t nx = 0;
     uint32_t ny = 0;
     std::string id; // optional user-defined id, for ex: can be set to image hash, useful for KV cache tracking
     bool is_audio = false; // true if the bitmap is audio
 
+    // lazy-loaded bitmap
+    mtmd_bitmap_lazy_callback lazy_callback = nullptr;
+    void * lazy_user_data = nullptr;
+
     mtmd_bitmap(const unsigned char * data, uint32_t nx, uint32_t ny)
-        : nx(nx), ny(ny) {
+        : nx(nx), ny(ny), is_audio(false) {
         if (data) {
             size_t data_size = (size_t)nx * ny * 3;
             this->data.resize(data_size);
@@ -62,6 +67,11 @@ struct mtmd_bitmap {
 
     size_t n_bytes() const {
         return data.size();
+    }
+
+    bool can_batch_with(const mtmd_bitmap & other) const {
+        // [QWEN_VIDEO] can batch if both are images with same size
+        return !is_audio && !other.is_audio && nx == other.nx && ny == other.ny;
     }
 
   private:
@@ -726,46 +736,163 @@ void mtmd_free(mtmd_context * ctx) {
 
 struct mtmd_tokenizer {
     mtmd_context * ctx;
-    std::vector<const mtmd_bitmap *> bitmaps;
 
     std::string input_text;
     bool add_special;
     bool parse_special;
     const llama_vocab * vocab;
 
+    struct part {
+        std::string text;
+        const mtmd_bitmap * bitmap;
+    };
+    std::vector<part> parts;
+    // these will be freed when mtmd_tokenizer finishes
+    std::vector<mtmd::bitmap> bm_from_lazy; // TODO @ngxson : refactor, free bm_from_lazy progressively
+    std::vector<const char *> text_from_lazy;
+
     mtmd_input_chunks cur;
     uint32_t n_images_added = 0; // 0-based index assigned to the next image chunk
 
+    ~mtmd_tokenizer() {
+        // note: mtmd::bitmap is already RAII
+        for (auto & str : text_from_lazy) {
+            free((void *)str);
+        }
+    }
+
     mtmd_tokenizer(mtmd_context * ctx,
             const mtmd_input_text * text,
-            const mtmd_bitmap ** bitmaps,
-            size_t n_bitmaps) : ctx(ctx), bitmaps(bitmaps, bitmaps + n_bitmaps) {
+            const mtmd_bitmap ** bmps,
+            size_t n_bitmaps) : ctx(ctx) {
         add_special   = text->add_special;
         parse_special = text->parse_special;
         input_text    = text->text;
         vocab         = ctx->vocab;
+
+        std::vector<const mtmd_bitmap *> bitmaps(bmps, bmps + n_bitmaps);
+        auto parts_str = split_text(input_text, ctx->media_marker);
+        size_t i_bm = 0;
+        for (const auto & part : parts_str) {
+            if (part == ctx->media_marker) {
+                if (i_bm >= bitmaps.size()) {
+                    throw std::runtime_error(string_format("number of media markers in text (%zu) exceeds number of bitmaps (%zu)", i_bm + 1, bitmaps.size()));
+                }
+                parts.push_back({"", bitmaps[i_bm++]});
+            } else {
+                parts.push_back({std::move(part), nullptr});
+            }
+        }
+
+        size_t n_markers = 0;
+        for (const auto & part : parts) {
+            if (part.bitmap != nullptr) {
+                n_markers++;
+            }
+        }
+        if (n_markers != bitmaps.size()) {
+            throw std::runtime_error(string_format("number of media markers in text (%zu) does not match number of bitmaps (%zu)", n_markers, bitmaps.size()));
+        }
+
+        expand_lazy_bitmaps();
+    }
+
+    void expand_lazy_bitmaps() {
+        std::vector<part> expanded;
+        expanded.reserve(parts.size());
+        for (auto & p : parts) {
+            if (p.bitmap != nullptr && p.bitmap->lazy_callback) {
+                LOG_DBG("%s: expanding lazy bitmap\n", __func__);
+                for (size_t i = 0;; i++) {
+                    char * out_str = nullptr;
+                    mtmd_bitmap * out_bm = nullptr;
+                    int res = p.bitmap->lazy_callback(i,
+                                    p.bitmap->lazy_user_data,
+                                    &out_bm,
+                                    &out_str);
+                    if (out_bm && out_str) {
+                        throw std::runtime_error(string_format("lazy callback cannot return both bitmap and text"));
+                    }
+                    if (res == 0) {
+                        // OK, append the returned chunk; lazy part is not yet added
+                        if (out_bm) {
+                            auto & ptr = bm_from_lazy.emplace_back(out_bm); // remember to free it later
+                            expanded.push_back({"", ptr.ptr.get()});
+                            LOG_DBG("%s: lazy callback returned bitmap with dimensions %d x %d\n", __func__, out_bm->nx, out_bm->ny);
+                        } else if (out_str) {
+                            auto & ptr = text_from_lazy.emplace_back(out_str); // remember to free it later
+                            expanded.push_back({ptr, nullptr});
+                            LOG_DBG("%s: lazy callback returned text: %s\n", __func__, out_str);
+                        }
+                    } else if (res == -1) {
+                        // EOF: lazy part removes itself (not added to expanded)
+                        break;
+                    } else if (res == -2) {
+                        // error
+                        throw std::runtime_error(string_format("lazy callback returned error"));
+                    }
+                }
+            } else {
+                expanded.push_back(std::move(p));
+            }
+        }
+        parts = std::move(expanded);
     }
 
     int32_t tokenize(mtmd_input_chunks * output) {
         cur.entries.clear();
-        std::vector<std::string> parts = split_text(input_text, ctx->media_marker);
-        size_t i_bm = 0; // index of the current bitmap
-        for (auto & part : parts) {
-            if (part == ctx->media_marker) {
-                // this is a marker, we should add the next bitmap
-                if (i_bm >= bitmaps.size()) {
+
+        // [QWEN_VIDEO] handle frame merging for models that support it (i.e. qwen-vl)
+        int n_merge_frames = 1;
+        if (ctx->ctx_v) {
+            n_merge_frames = clip_model_n_batch_max(ctx->ctx_v);
+            GGML_ASSERT(n_merge_frames <= 2 && "we only support merging maximum 2 images for now; open an issue if this model supports merging more");
+        }
+
+        // Build merged_bitmaps: each entry is a group of 1 or 2 bitmaps.
+        // For consecutive mergeable bitmap parts, merge them and collapse the second part out of this->parts.
+        std::vector<std::vector<const mtmd_bitmap *>> merged_bitmaps;
+        if (n_merge_frames > 1) {
+            for (size_t i = 0; i < parts.size(); ++i) {
+                if (parts[i].bitmap == nullptr) {
+                    continue;
+                }
+                if (i + 1 < parts.size() && parts[i + 1].bitmap != nullptr) {
+                    const mtmd_bitmap * bm_a = parts[i].bitmap;
+                    const mtmd_bitmap * bm_b = parts[i + 1].bitmap;
+                    if (bm_a->can_batch_with(*bm_b)) {
+                        LOG_DBG("%s: merging 2 frames at part index %zu and %zu\n", __func__, i, i + 1);
+                        merged_bitmaps.push_back({bm_a, bm_b});
+                        parts.erase(parts.begin() + i + 1); // collapse the second bitmap part
+                        continue;
+                    }
+                }
+                LOG_DBG("%s: no merging for part index %zu\n", __func__, i);
+                merged_bitmaps.push_back({parts[i].bitmap});
+            }
+        } else {
+            for (const auto & p : parts) {
+                if (p.bitmap != nullptr) {
+                    merged_bitmaps.push_back({p.bitmap});
+                }
+            }
+        }
+
+        size_t i_bm = 0;
+        for (const auto & p : parts) {
+            if (p.bitmap != nullptr) {
+                if (i_bm >= merged_bitmaps.size()) {
                     LOG_ERR("%s: error: number of bitmaps (%zu) does not match number of markers (%zu)\n",
-                            __func__, bitmaps.size(), parts.size() - 1);
+                            __func__, merged_bitmaps.size(), parts.size() - 1);
                     return 1;
                 }
-                const mtmd_bitmap * bitmap = bitmaps[i_bm++];
-                int32_t res = add_media(bitmap);
+                auto bmps = merged_bitmaps[i_bm++];
+                int32_t res = add_media(bmps);
                 if (res != 0) {
                     return res;
                 }
             } else {
-                // this is a text part, we should add it as text
-                add_text(part, parse_special);
+                add_text(p.text, parse_special);
             }
         }
 
@@ -794,9 +921,9 @@ struct mtmd_tokenizer {
             }
         }
 
-        if (i_bm != bitmaps.size()) {
+        if (i_bm != merged_bitmaps.size()) {
             LOG_ERR("%s: error: number of bitmaps (%zu) does not match number of markers (%zu)\n",
-                    __func__, bitmaps.size(), parts.size() - 1);
+                    __func__, merged_bitmaps.size(), parts.size() - 1);
             return 1;
         }
 
@@ -835,8 +962,10 @@ struct mtmd_tokenizer {
         }
     }
 
-    int32_t add_media(const mtmd_bitmap * bitmap) {
-        if (!bitmap->is_audio) {
+    int32_t add_media(std::vector<const mtmd_bitmap *> & bitmaps) {
+        GGML_ASSERT(!bitmaps.empty());
+
+        if (!bitmaps[0]->is_audio) {
             // handle image
 
             if (!ctx->ctx_v) {
@@ -848,27 +977,44 @@ struct mtmd_tokenizer {
                 add_text(ctx->img_beg, true); // add image begin token
             }
 
-            // sanity check
-            if (bitmap->nx <= 0 || bitmap->ny <= 0) {
-                LOG_ERR("%s: error: invalid bitmap dimensions: nx = %d, ny = %d\n",
-                        __func__, bitmap->nx, bitmap->ny);
-                return 2;
-            }
-            GGML_ASSERT(ctx->image_preproc != nullptr);
+            // TODO @ngxson : this is quite hacky because preprocessor only support batch with one single element, that need to be fixed in the future (e.g. by changing the preprocessor interface always take single input)
 
-            // convert mtmd_bitmap to clip_image_u8
-            clip_image_u8_ptr img_u8(clip_image_u8_init());
-            img_u8->set_size(
-                {(int)bitmap->nx, (int)bitmap->ny},
-                bitmap->is_placeholder());
-            img_u8->cpy_buf(bitmap->get_ro_buf());
-
-            // preprocess image
             clip_image_f32_batch batch_f32;
-            bool ok = ctx->image_preproc->preprocess(*img_u8, batch_f32);
-            if (!ok) {
-                LOG_ERR("Unable to preprocess image\n");
-                return 2;
+
+            for (const auto * bmp : bitmaps) {
+                // sanity check
+                GGML_ASSERT(!bmp->is_audio);
+                GGML_ASSERT(ctx->image_preproc != nullptr);
+                if (bmp->nx <= 0 || bmp->ny <= 0) {
+                    LOG_ERR("%s: error: invalid bitmap dimensions: nx = %d, ny = %d\n",
+                            __func__, bmp->nx, bmp->ny);
+                    return 2;
+                }
+
+                // convert mtmd_bitmap to clip_image_u8
+                clip_image_u8_ptr img_u8(clip_image_u8_init());
+                img_u8->set_size(
+                    {(int)bmp->nx, (int)bmp->ny},
+                    bmp->is_placeholder());
+                img_u8->cpy_buf(bmp->get_ro_buf());
+
+                // preprocess image
+                clip_image_f32_batch tmp_batch;
+                bool ok = ctx->image_preproc->preprocess(*img_u8, tmp_batch);
+                if (!ok) {
+                    LOG_ERR("Unable to preprocess image\n");
+                    return 2;
+                }
+
+                // move entries and grid dimensions to the "global" batch_f32
+                for (auto & entry : tmp_batch.entries) {
+                    batch_f32.entries.emplace_back(std::move(entry));
+                }
+
+                // for llava-uhd style, we need to handle grid too
+                // we don't care about overwriting these values for now because llama-uhd doesn't support batching anyway
+                batch_f32.grid_x = tmp_batch.grid_x;
+                batch_f32.grid_y = tmp_batch.grid_y;
             }
 
             // Annotate llava-next style tiles so clip_n_output_tokens accounts
@@ -896,11 +1042,14 @@ struct mtmd_tokenizer {
                 || ctx->slice_tmpl == MTMD_SLICE_TMPL_STEP3VL
                 || (ctx->slice_tmpl == MTMD_SLICE_TMPL_LFM2 && has_tiling_grid)
             ) {
+                // [QWEN_VIDEO] we do not support "frame merging" for llama-uhd style, so no batching for now
+                GGML_ASSERT(bitmaps.size() == 1);
+
                 const int n_col = batch_f32.grid_x;
                 const int n_row = batch_f32.grid_y;
                 // split batch into chunks of single images
                 // NOTE: batch_f32 will be invalidated after this call
-                auto chunks = split_batch_to_chunk(std::move(batch_f32), bitmap->id);
+                auto chunks = split_batch_to_chunk(std::move(batch_f32), bitmaps[0]->id);
                 GGML_ASSERT(chunks.size() > 0);
 
                 auto ov_chunk = std::move(chunks.front());
@@ -954,6 +1103,10 @@ struct mtmd_tokenizer {
                 size_t n_tokens = 0;
                 for (const auto & e : batch_f32.entries) {
                     n_tokens += clip_n_output_tokens(ctx->ctx_v, e.get());
+                    if (clip_model_n_batch_max(ctx->ctx_v) == 2) {
+                        // [QWEN_VIDEO] pair input is merged to the same embd, so only count as one image
+                        break;
+                    }
                 }
 
                 mtmd_image_tokens_ptr image_tokens(new mtmd_image_tokens);
@@ -976,7 +1129,7 @@ struct mtmd_tokenizer {
                     GGML_ASSERT(n_tokens == (size_t)image_tokens->n_tokens());
                 }
                 image_tokens->batch_f32 = std::move(batch_f32);
-                image_tokens->id = bitmap->id; // optional
+                image_tokens->id = bitmaps[0]->id; // optional
 
                 LOG_DBG("image_tokens->nx = %d\n", image_tokens->nx);
                 LOG_DBG("image_tokens->ny = %d\n", image_tokens->ny);
@@ -1000,6 +1153,9 @@ struct mtmd_tokenizer {
 
         } else {
             // handle audio
+
+            GGML_ASSERT(bitmaps.size() == 1); // no batching support for now
+            auto & bitmap = bitmaps[0];
 
             if (!ctx->ctx_a) {
                 LOG_ERR("%s: error: model does not support audio input\n", __func__);
@@ -1162,8 +1318,13 @@ int32_t mtmd_tokenize(mtmd_context * ctx,
             const mtmd_input_text * text,
             const mtmd_bitmap ** bitmaps,
             size_t n_bitmaps) {
-    mtmd_tokenizer tokenizer(ctx, text, bitmaps, n_bitmaps);
-    return tokenizer.tokenize(output);
+    try {
+        mtmd_tokenizer tokenizer(ctx, text, bitmaps, n_bitmaps);
+        return tokenizer.tokenize(output);
+    } catch (const std::exception & e) {
+        LOG_ERR("%s: error: %s\n", __func__, e.what());
+        return 2;
+    }
 }
 
 int32_t mtmd_encode_chunk(mtmd_context * ctx, const mtmd_input_chunk * chunk) {
@@ -1299,6 +1460,10 @@ int mtmd_get_audio_sample_rate(const mtmd_context * ctx) {
     return clip_get_hparams(ctx->ctx_a)->audio_sample_rate;
 }
 
+const char * mtmd_get_marker(const mtmd_context * ctx) {
+    return ctx->media_marker.c_str();
+}
+
 //
 // public API functions
 //
@@ -1331,10 +1496,16 @@ uint32_t mtmd_bitmap_get_ny(const mtmd_bitmap * bitmap) {
 }
 
 const unsigned char * mtmd_bitmap_get_data(const mtmd_bitmap * bitmap) {
+    if (bitmap->is_placeholder()) {
+        return nullptr;
+    }
     return bitmap->get_ro_buf().data();
 }
 
 size_t mtmd_bitmap_get_n_bytes(const mtmd_bitmap * bitmap) {
+    if (bitmap->is_placeholder()) {
+        return 0;
+    }
     return bitmap->get_ro_buf().size();
 }
 
@@ -1352,6 +1523,18 @@ void mtmd_bitmap_set_id(mtmd_bitmap * bitmap, const char * id) {
     } else {
         bitmap->id.clear();
     }
+}
+
+mtmd_bitmap * mtmd_bitmap_init_lazy(mtmd_context * ctx,
+                                    const char * id,
+                                    void * user_data,
+                                    mtmd_bitmap_lazy_callback callback) {
+    GGML_UNUSED(ctx); // reserved for future use
+    mtmd_bitmap * bitmap = new mtmd_bitmap(nullptr, 0, 0);
+    bitmap->lazy_callback = callback;
+    bitmap->lazy_user_data = user_data;
+    mtmd_bitmap_set_id(bitmap, id);
+    return bitmap;
 }
 
 void mtmd_bitmap_free(mtmd_bitmap * bitmap) {
